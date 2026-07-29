@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
 
@@ -306,8 +307,9 @@ func TestWALWrite_Telemetry(t *testing.T) {
 	// Test successful WAL write
 	err = prw.handleExport(t.Context(), metrics, nil)
 	require.NoError(t, err)
+	exporterAttr := attribute.NewSet(attribute.String("exporter", set.ID.String()))
 	metadatatest.AssertEqualExporterPrometheusremotewriteWalWrites(t, tel,
-		[]metricdata.DataPoint[int64]{{Value: 1}},
+		[]metricdata.DataPoint[int64]{{Value: 1, Attributes: exporterAttr}},
 		metricdatatest.IgnoreTimestamp())
 
 	// Test failed WAL write by causing an out-of-order write error
@@ -317,7 +319,7 @@ func TestWALWrite_Telemetry(t *testing.T) {
 	err = prw.handleExport(t.Context(), metrics, nil)
 	require.Error(t, err)
 	metadatatest.AssertEqualExporterPrometheusremotewriteWalWritesFailures(t, tel,
-		[]metricdata.DataPoint[int64]{{Value: 1}},
+		[]metricdata.DataPoint[int64]{{Value: 1, Attributes: exporterAttr}},
 		metricdatatest.IgnoreTimestamp())
 
 	_, err = tel.GetMetric("otelcol_exporter_prometheusremotewrite_wal_write_latency")
@@ -460,4 +462,56 @@ func TestWALLag_Telemetry(t *testing.T) {
 
 	_, err = tel.GetMetric("otelcol_exporter_prometheusremotewrite_wal_lag")
 	require.NoError(t, err)
+}
+
+// TestWAL_TelemetryExporterAttribute verifies that WAL telemetry carries the
+// "exporter" attribute set to the exporter's component ID, so metrics can be
+// disambiguated when multiple PRW exporters share a collector.
+func TestWAL_TelemetryExporterAttribute(t *testing.T) {
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() {
+		require.NoError(t, tel.Shutdown(context.Background())) //nolint:usetesting
+	})
+	set := metadatatest.NewSettings(tel)
+
+	cfg := &Config{
+		WAL: configoptional.Some(WALConfig{
+			Directory: t.TempDir(),
+		}),
+		RemoteWriteProtoMsg: remoteapi.WriteV2MessageType,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	defer server.Close()
+
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Endpoint = server.URL
+	cfg.ClientConfig = clientConfig
+
+	prw, err := newPRWExporter(cfg, set)
+	require.NotNil(t, prw)
+	require.NoError(t, err)
+
+	require.NoError(t, prw.Start(t.Context(), componenttest.NewNopHost()))
+	t.Cleanup(func() {
+		assert.NoError(t, prw.Shutdown(context.Background())) //nolint:usetesting
+	})
+
+	metrics := map[string]*prompb.TimeSeries{
+		"test_metric": {
+			Labels:  []prompb.Label{{Name: "__name__", Value: "test_metric"}},
+			Samples: []prompb.Sample{{Value: 1, Timestamp: 100}},
+		},
+	}
+	require.NoError(t, prw.handleExport(t.Context(), metrics, nil))
+
+	// The wal_writes metric must carry the exporter attribute set to the
+	// component ID supplied by the test settings.
+	expectedAttr := attribute.String("exporter", set.ID.String())
+	metadatatest.AssertEqualExporterPrometheusremotewriteWalWrites(t, tel,
+		[]metricdata.DataPoint[int64]{{
+			Value:      1,
+			Attributes: attribute.NewSet(expectedAttr),
+		}},
+		metricdatatest.IgnoreTimestamp())
 }
